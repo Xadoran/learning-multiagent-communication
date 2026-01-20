@@ -21,6 +21,7 @@ Trains CommNet and NoComm sequentially, saves checkpoints and a reward plot.
 python train.py --episodes 2000 --agents 3 --comm_steps 2 --plot_path plots/commnet_vs_nocomm.png
 ```
 Key flags:
+- `--env`: which environment (`nav` for navigation, `lever` for lever game)
 - `--episodes`: training episodes per model
 - `--agents`: number of agents J
 - `--comm_steps`: communication layers K
@@ -30,24 +31,37 @@ Key flags:
 - `--spawn_span`: half-width of spawn/goal box (larger -> harder, more spread)
 - `--alpha_value`: weight for value loss (baseline)
 - `--entropy_beta`: entropy bonus for exploration
+- `--pool_size`: lever game pool size (number of possible agent IDs)
+- `--num_levers`: lever game number of levers (defaults to agents)
+- `--lever_supervised`: for lever game, use supervised optimal assignment instead of RL
+- `--lever_identity_encoder`: for lever game, use identity encoder (hidden_dim=obs_dim) to preserve agent ID mask
 
 Outputs:
 - Checkpoints: `checkpoints/commnet.pt`, `checkpoints/nocomm.pt`
 - Plot: `plots/commnet_vs_nocomm.png` (moving-average returns)
 
 ## Evaluate
-Run a saved policy (greedy actions by argmax):
+Run a saved policy (greedy actions by argmax by default):
 ```bash
-python eval.py --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50
-python eval.py --policy nocomm --checkpoint checkpoints/nocomm.pt --episodes 50
+python eval.py --env nav --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50
+python eval.py --env nav --policy nocomm --checkpoint checkpoints/nocomm.pt --episodes 50
+
+# Lever game
+python eval.py --env lever --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50 --greedy   # argmax actions
+python eval.py --env lever --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50           # sampling (omit --greedy)
 ```
 Reports mean return and success rate (all agents within goal tolerance).
 
 ## Environment details
-- 2D square workspace, agents spawn/goals in [-0.4, 0.4]^2, discrete moves {stay, up, down, left, right} with step size 0.25 (defaults).
-- Observations per agent: own position (2), shared goal (2 by default), relative positions of other agents within vision radius (masked to zero otherwise). Default vision radius is 0.4 to make communication valuable.
-- Shared reward each step: `progress_scale*(prev_mean_dist - mean_dist) - time_penalty - collision_penalty` + success bonus when all agents are within `goal_eps`.
-- Episode ends on success or when `max_steps` reached (default 40). Defaults are tuned to keep the task learnable while partial observability still matters.
+- Navigation (`envs/coop_nav_env.py`):
+  - 2D square workspace, agents spawn/goals in [-0.4, 0.4]^2, discrete moves {stay, up, down, left, right} with step size 0.25 (defaults).
+  - Observations per agent: own position (2), shared goal (2 by default), relative positions of other agents within vision radius (masked to zero otherwise). Default vision radius is 0.4 to make communication valuable.
+  - Shared reward each step: `progress_scale*(prev_mean_dist - mean_dist) - time_penalty - collision_penalty` + success bonus when all agents are within `goal_eps`.
+  - Episode ends on success or when `max_steps` reached (default 40). Defaults are tuned to keep the task learnable while partial observability still matters.
+
+- Lever game (`envs/lever_game_env.py`):
+  - Pool of N agent IDs (pool_size); each episode samples M active agents (agents). Each active agent observes only its own ID (one-hot over pool_size).
+  - Each agent chooses a lever simultaneously; reward = (# distinct levers chosen) / m (num_levers). Episode is one step.
 
 ## Troubleshooting
 - NumPy ABI: if you see errors like "module compiled for NumPy 1.x cannot run on NumPy 2.x", reinstall with `pip install 'numpy<2' --force-reinstall`.
