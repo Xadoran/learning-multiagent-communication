@@ -88,8 +88,9 @@ def main():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--alpha_value", type=float, default=0.03)
     parser.add_argument("--entropy_beta", type=float, default=0.02)
-    parser.add_argument("--max_steps", type=int, default=50)
-    parser.add_argument("--vision", type=float, default=0.75)
+    parser.add_argument("--max_steps", type=int, default=40)
+    parser.add_argument("--vision", type=float, default=0.4)
+    parser.add_argument("--spawn_span", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
@@ -101,6 +102,7 @@ def main():
         num_agents=args.agents,
         max_steps=args.max_steps,
         vision_radius=args.vision,
+        spawn_span=args.spawn_span,
         seed=args.seed,
     )
 
