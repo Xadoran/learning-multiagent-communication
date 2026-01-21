@@ -53,7 +53,7 @@ class LeverGameEnv:
         distinct = len(set(actions.tolist()))
         reward = distinct / float(self.num_levers)
         done = True  # single-step episode
-        info = {"distinct": distinct}
+        info = {"distinct": distinct, "success": distinct == self.num_levers}
         obs = self.reset()  # stateless across episodes
         return obs, reward, done, info
 

@@ -85,31 +85,48 @@ def train_lever_supervised(
     policy: CommNetPolicy,
     lr: float = 3e-4,
     entropy_beta: float = 0.01,
+    batch_size: int = 256,
 ):
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     ce_loss = nn.CrossEntropyLoss()
     episode_returns: List[float] = []
 
+    pool_size = env.pool_size
+    active_agents = env.active_agents
+    num_levers = env.num_levers
+
     for ep in range(episodes):
-        obs = env.reset()
-        target_np = env.optimal_actions()
-        target = torch.tensor(target_np, dtype=torch.long)  # [J]
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # [1,J,obs_dim]
+        # Sample a batch of episodes by drawing active IDs without replacement
+        scores = env.rng.random((batch_size, pool_size))
+        ids = np.argsort(scores, axis=1)[:, :active_agents]  # [B, J]
+
+        obs = np.zeros((batch_size, active_agents, pool_size), dtype=np.float32)
+        batch_idx = np.arange(batch_size)[:, None]
+        agent_idx = np.arange(active_agents)[None, :]
+        obs[batch_idx, agent_idx, ids] = 1.0
+
+        # Optimal assignment: sort IDs and assign ranks to levers
+        order = np.argsort(ids, axis=1)  # [B, J]
+        targets = np.zeros((batch_size, active_agents), dtype=np.int64)
+        for b in range(batch_size):
+            for rank, idx in enumerate(order[b]):
+                targets[b, idx] = rank % num_levers
+
+        obs_t = torch.tensor(obs, dtype=torch.float32)
+        target_t = torch.tensor(targets, dtype=torch.long)
 
         logits, _ = policy.forward(obs_t)
         dist = torch.distributions.Categorical(logits=logits)
         entropy = dist.entropy().mean()
-
-        loss = ce_loss(logits.view(-1, policy.action_dim), target) - entropy_beta * entropy
+        loss = ce_loss(logits.view(-1, policy.action_dim), target_t.view(-1)) - entropy_beta * entropy
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
 
-        # Reward for optimal assignment should be 1.0
-        ep_ret = len(set(target_np.tolist())) / float(env.num_levers)
-        episode_returns.append(ep_ret)
+        # Perfect assignment yields 1.0 reward
+        episode_returns.append(1.0)
         if (ep + 1) % 100 == 0:
             avg_last = np.mean(episode_returns[-100:])
             print(f"[Lever supervised] Episode {ep+1}/{episodes} | avg return (last 100): {avg_last:.3f}")
@@ -130,10 +147,23 @@ def main():
     parser.add_argument("--max_steps", type=int, default=40)
     parser.add_argument("--vision", type=float, default=0.4)
     parser.add_argument("--spawn_span", type=float, default=0.4)
+    parser.add_argument("--collision_penalty", type=float, default=0.2)
+    parser.add_argument("--success_bonus", type=float, default=20.0)
+    parser.add_argument("--progress_scale", type=float, default=2.0)
+    parser.add_argument("--step_size", type=float, default=0.25)
+    parser.add_argument("--goal_eps", type=float, default=0.2)
+    parser.add_argument("--time_penalty", type=float, default=0.0)
+    parser.add_argument("--distance_weight", type=float, default=1.0)
     parser.add_argument("--num_levers", type=int, default=None)
     parser.add_argument("--pool_size", type=int, default=500)
     parser.add_argument("--lever_supervised", action="store_true", help="Use supervised lever policy (optimal assignment) instead of RL")
     parser.add_argument("--lever_identity_encoder", action="store_true", help="Use identity encoder for lever game (hidden_dim=obs_dim)")
+    parser.add_argument("--lever_batch", type=int, default=256, help="Batch size for supervised lever training")
+    parser.add_argument("--comm_mlp", action="store_true", help="Use 2-layer MLP for comm blocks (more expressive)")
+    parser.add_argument("--comm_mlp_hidden", type=int, default=None, help="Hidden size for comm MLP blocks")
+    parser.add_argument("--lever_rank_features", action="store_true", help="Add prefix-sum rank features for lever game (requires identity encoder)")
+    parser.add_argument("--no_encoder_activation", action="store_true", help="Disable encoder tanh activation (useful for lever)")
+    parser.add_argument("--no_comm_activation", action="store_true", help="Disable comm layer tanh activation (useful for lever)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
@@ -147,6 +177,13 @@ def main():
             max_steps=args.max_steps,
             vision_radius=args.vision,
             spawn_span=args.spawn_span,
+            collision_penalty=args.collision_penalty,
+            success_bonus=args.success_bonus,
+            progress_scale=args.progress_scale,
+            step_size=args.step_size,
+            goal_eps=args.goal_eps,
+            time_penalty=args.time_penalty,
+            distance_weight=args.distance_weight,
             seed=args.seed,
         )
     else:
@@ -169,6 +206,11 @@ def main():
         K=args.comm_steps,
         use_comm=True,
         identity_encoder=(args.env == "lever" and args.lever_identity_encoder),
+        comm_mlp=args.comm_mlp,
+        comm_mlp_hidden=args.comm_mlp_hidden,
+        lever_rank_features=(args.env == "lever" and args.lever_rank_features),
+        encoder_activation=not args.no_encoder_activation,
+        comm_activation=not args.no_comm_activation,
     )
     if use_supervised_lever:
         comm_returns = train_fn(
@@ -177,6 +219,7 @@ def main():
             policy=comm_policy,
             lr=args.lr,
             entropy_beta=args.entropy_beta,
+            batch_size=args.lever_batch,
         )
     else:
         comm_returns = train_fn(
@@ -197,6 +240,11 @@ def main():
         K=args.comm_steps,
         use_comm=False,
         identity_encoder=(args.env == "lever" and args.lever_identity_encoder),
+        comm_mlp=args.comm_mlp,
+        comm_mlp_hidden=args.comm_mlp_hidden,
+        lever_rank_features=(args.env == "lever" and args.lever_rank_features),
+        encoder_activation=not args.no_encoder_activation,
+        comm_activation=not args.no_comm_activation,
     )
     if use_supervised_lever:
         nocomm_returns = train_fn(
@@ -205,6 +253,7 @@ def main():
             policy=nocomm_policy,
             lr=args.lr,
             entropy_beta=args.entropy_beta,
+            batch_size=args.lever_batch,
         )
     else:
         nocomm_returns = train_fn(

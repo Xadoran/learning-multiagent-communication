@@ -30,12 +30,13 @@ class CooperativeNavEnv:
         vision_radius: float = 0.4,
         goal_eps: float = 0.2,
         collision_radius: float = 0.1,
-        collision_penalty: float = 1.0,
-        success_bonus: float = 12.0,
+        collision_penalty: float = 0.2,
+        success_bonus: float = 20.0,
         shared_goal: bool = True,
         time_penalty: float = 0.0,
         spawn_span: float = 0.4,
         progress_scale: float = 2.0,
+        distance_weight: float = 1.0,
         seed: int | None = None,
     ):
         self.num_agents = num_agents
@@ -50,6 +51,7 @@ class CooperativeNavEnv:
         self.time_penalty = time_penalty
         self.spawn_span = spawn_span
         self.progress_scale = progress_scale
+        self.distance_weight = distance_weight
         self.rng = np.random.default_rng(seed)
 
         # Observation: own pos (2) + own goal (2) + relative positions of others ((J-1)*2)
@@ -106,7 +108,12 @@ class CooperativeNavEnv:
                     collision_penalty += self.collision_penalty
 
         progress = self.last_mean_dist - mean_dist
-        reward = self.progress_scale * progress - collision_penalty - self.time_penalty
+        reward = (
+            -self.distance_weight * mean_dist
+            + self.progress_scale * progress
+            - collision_penalty
+            - self.time_penalty
+        )
         success = bool(np.all(dists < self.goal_eps))
         if success:
             reward += self.success_bonus
