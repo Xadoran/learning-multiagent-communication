@@ -57,6 +57,9 @@ def train_policy(
     alpha_value: float = 0.03,
     entropy_beta: float = 0.01,
     batch_size: int = 1,
+    checkpoint_path: str | None = None,
+    save_checkpoint_every: int | None = None,
+    checkpoint_prefix: str = "checkpoint",
 ):
     """
     Train policy using REINFORCE with baseline.
@@ -70,12 +73,25 @@ def train_policy(
         alpha_value: Weight for value loss
         entropy_beta: Entropy bonus coefficient
         batch_size: Number of episodes to collect before updating (default: 1 for single-episode updates)
+        checkpoint_path: Path to checkpoint file to resume from (optional)
+        save_checkpoint_every: Save checkpoint every N episodes (optional)
     """
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
     episode_returns: List[float] = []
+    start_episode = 0
 
-    for ep in range(episodes):
+    # Load checkpoint if provided
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        policy.load_state_dict(checkpoint["policy_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_episode = checkpoint.get("episode", 0)
+        episode_returns = checkpoint.get("episode_returns", [])
+        print(f"Resumed from episode {start_episode}, {len(episode_returns)} episodes in history")
+
+    for ep in range(start_episode, episodes):
         # Collect batch of episodes
         batch_returns = []
         batch_advantages = []
@@ -122,6 +138,24 @@ def train_policy(
             avg_last = np.mean(episode_returns[-100:]) if len(episode_returns) >= 100 else np.mean(episode_returns)
             total_episodes = len(episode_returns)
             print(f"Episode {ep+1}/{episodes} (total: {total_episodes}) | avg return (last 100): {avg_last:.3f} | batch_size: {batch_size}")
+        
+        # Save checkpoint periodically if requested
+        if save_checkpoint_every and (ep + 1) % save_checkpoint_every == 0:
+            checkpoint = {
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "episode": ep + 1,
+                "episode_returns": episode_returns,
+            }
+            if checkpoint_path:
+                # If resuming from checkpoint, save to same path
+                checkpoint_file = checkpoint_path
+            else:
+                # Otherwise, save with episode number
+                checkpoint_file = f"checkpoints/{checkpoint_prefix}_ep{ep+1}.pt"
+            os.makedirs(os.path.dirname(checkpoint_file) if os.path.dirname(checkpoint_file) else ".", exist_ok=True)
+            torch.save(checkpoint, checkpoint_file)
+            print(f"Saved checkpoint to {checkpoint_file} at episode {ep+1}")
     
     return episode_returns
 
@@ -133,16 +167,30 @@ def train_lever_supervised(
     lr: float = 3e-4,
     entropy_beta: float = 0.01,
     batch_size: int = 256,
+    checkpoint_path: str | None = None,
+    save_checkpoint_every: int | None = None,
+    checkpoint_prefix: str = "checkpoint",
 ):
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     ce_loss = nn.CrossEntropyLoss()
     episode_returns: List[float] = []
+    start_episode = 0
+
+    # Load checkpoint if provided
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        policy.load_state_dict(checkpoint["policy_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_episode = checkpoint.get("episode", 0)
+        episode_returns = checkpoint.get("episode_returns", [])
+        print(f"Resumed from episode {start_episode}, {len(episode_returns)} episodes in history")
 
     pool_size = env.pool_size
     active_agents = env.active_agents
     num_levers = env.num_levers
 
-    for ep in range(episodes):
+    for ep in range(start_episode, episodes):
         # Sample a batch of episodes by drawing active IDs without replacement
         scores = env.rng.random((batch_size, pool_size))
         ids = np.argsort(scores, axis=1)[:, :active_agents]  # [B, J]
@@ -177,6 +225,25 @@ def train_lever_supervised(
         if (ep + 1) % 100 == 0:
             avg_last = np.mean(episode_returns[-100:])
             print(f"[Lever supervised] Episode {ep+1}/{episodes} | avg return (last 100): {avg_last:.3f}")
+        
+        # Save checkpoint periodically if requested
+        if save_checkpoint_every and (ep + 1) % save_checkpoint_every == 0:
+            checkpoint = {
+                "policy_state_dict": policy.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "episode": ep + 1,
+                "episode_returns": episode_returns,
+            }
+            if checkpoint_path:
+                # If resuming from checkpoint, save to same path
+                checkpoint_file = checkpoint_path
+            else:
+                # Otherwise, save with episode number
+                checkpoint_file = f"checkpoints/{checkpoint_prefix}_ep{ep+1}.pt"
+            os.makedirs(os.path.dirname(checkpoint_file) if os.path.dirname(checkpoint_file) else ".", exist_ok=True)
+            torch.save(checkpoint, checkpoint_file)
+            print(f"Saved checkpoint to {checkpoint_file} at episode {ep+1}")
+    
     return episode_returns
 
 
@@ -220,6 +287,8 @@ def main():
     parser.add_argument("--catch_radius", type=float, default=1.0, help="Catch radius for predator-prey")
     parser.add_argument("--prey_move_prob", type=float, default=0.5, help="Probability prey moves each step")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for RL training (number of episodes per update, default: 1)")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint file to resume training from")
+    parser.add_argument("--save_checkpoint_every", type=int, default=None, help="Save checkpoint every N episodes (optional)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
@@ -296,6 +365,13 @@ def main():
         encoder_activation=not args.no_encoder_activation,
         comm_activation=not args.no_comm_activation,
     )
+    
+    # Determine checkpoint paths
+    comm_checkpoint = args.resume_checkpoint if args.resume_checkpoint else None
+    if comm_checkpoint and not os.path.exists(comm_checkpoint):
+        print(f"Warning: Checkpoint {comm_checkpoint} not found, starting from scratch")
+        comm_checkpoint = None
+    
     if use_supervised_lever:
         comm_returns = train_fn(
             episodes=args.episodes,
@@ -304,6 +380,9 @@ def main():
             lr=args.lr,
             entropy_beta=args.entropy_beta,
             batch_size=args.lever_batch,
+            checkpoint_path=comm_checkpoint,
+            save_checkpoint_every=args.save_checkpoint_every,
+            checkpoint_prefix="commnet",
         )
     else:
         comm_returns = train_fn(
@@ -315,6 +394,9 @@ def main():
             alpha_value=args.alpha_value,
             entropy_beta=args.entropy_beta,
             batch_size=args.batch_size,
+            checkpoint_path=comm_checkpoint,
+            save_checkpoint_every=args.save_checkpoint_every,
+            checkpoint_prefix="commnet",
         )
 
     # No-communication baseline
@@ -331,6 +413,15 @@ def main():
         encoder_activation=not args.no_encoder_activation,
         comm_activation=not args.no_comm_activation,
     )
+    
+    # For nocomm, use separate checkpoint path if provided (or None)
+    nocomm_checkpoint = None
+    if args.resume_checkpoint:
+        # Try to find nocomm checkpoint by replacing commnet with nocomm in path
+        nocomm_checkpoint = args.resume_checkpoint.replace("commnet", "nocomm")
+        if not os.path.exists(nocomm_checkpoint):
+            nocomm_checkpoint = None
+    
     if use_supervised_lever:
         nocomm_returns = train_fn(
             episodes=args.episodes,
@@ -339,6 +430,9 @@ def main():
             lr=args.lr,
             entropy_beta=args.entropy_beta,
             batch_size=args.lever_batch,
+            checkpoint_path=nocomm_checkpoint,
+            save_checkpoint_every=args.save_checkpoint_every,
+            checkpoint_prefix="nocomm",
         )
     else:
         nocomm_returns = train_fn(
@@ -350,6 +444,9 @@ def main():
             alpha_value=args.alpha_value,
             entropy_beta=args.entropy_beta,
             batch_size=args.batch_size,
+            checkpoint_path=nocomm_checkpoint,
+            save_checkpoint_every=args.save_checkpoint_every,
+            checkpoint_prefix="nocomm",
         )
 
     os.makedirs("checkpoints", exist_ok=True)
