@@ -58,10 +58,35 @@ Key flags:
 - `--num_prey`: number of prey in predator-prey environment (default: 1)
 - `--catch_radius`: catch radius for predator-prey (default: 1.0)
 - `--prey_move_prob`: probability prey moves each step (default: 0.5)
+- `--batch_size`: batch size for RL training (number of episodes per update, default: 1 for single-episode updates)
+- `--resume_checkpoint`: path to checkpoint file to resume training from (optional)
+- `--save_checkpoint_every`: save checkpoint every N episodes (optional, enables periodic checkpoint saving)
 
 Outputs:
-- Checkpoints: `checkpoints/commnet.pt`, `checkpoints/nocomm.pt`
+- Checkpoints: `checkpoints/commnet.pt`, `checkpoints/nocomm.pt` (final checkpoints)
+- Periodic checkpoints: `checkpoints/commnet_ep{N}.pt`, `checkpoints/nocomm_ep{N}.pt` (if `--save_checkpoint_every` is set)
 - Plot: `plots/commnet_vs_nocomm.png` (moving-average returns)
+
+### Batch Training
+For faster and more stable training, use batch training to collect multiple episodes before updating:
+```bash
+.venv/Scripts/python train.py --env nav --episodes 2000 --batch_size 8
+```
+This collects 8 episodes before each gradient update, averaging losses across the batch for more stable training.
+
+### Checkpoint Resuming
+Resume training from a saved checkpoint:
+```bash
+.venv/Scripts/python train.py --env nav --episodes 2000 --resume_checkpoint checkpoints/commnet_ep500.pt
+```
+The checkpoint includes policy state, optimizer state, episode count, and returns history.
+
+### Periodic Checkpoint Saving
+Save checkpoints periodically during training:
+```bash
+.venv/Scripts/python train.py --env nav --episodes 2000 --save_checkpoint_every 500
+```
+This saves checkpoints every 500 episodes to `checkpoints/commnet_ep{N}.pt` and `checkpoints/nocomm_ep{N}.pt`.
 
 ## Evaluate
 Run a saved policy. By default actions are sampled; add `--greedy` to use argmax actions.
@@ -113,7 +138,7 @@ Reports mean return and success rate (all agents within goal tolerance).
 ## Recommended runs
 Navigation (moderate difficulty, fair comparison):
 ```bash
-.venv/Scripts/python train.py --env nav --episodes 2000 --agents 3 --comm_steps 2 --hidden 64 --vision 0.3 --spawn_span 0.6 --collision_penalty 0.2 --success_bonus 20 --progress_scale 2.0 --distance_weight 0.2 --step_size 0.25 --goal_eps 0.2 --entropy_beta 0.02 --plot_path plots/commnet_vs_nocomm.png
+.venv/Scripts/python train.py --env nav --episodes 2000 --agents 3 --comm_steps 2 --hidden 64 --vision 0.3 --spawn_span 0.6 --collision_penalty 0.2 --success_bonus 20 --progress_scale 2.0 --distance_weight 0.2 --step_size 0.25 --goal_eps 0.2 --entropy_beta 0.02 --batch_size 4 --save_checkpoint_every 500 --plot_path plots/commnet_vs_nocomm.png
 .venv/Scripts/python eval.py --env nav --policy commnet --checkpoint checkpoints/commnet.pt --agents 3 --hidden 64 --comm_steps 2 --vision 0.3 --spawn_span 0.6 --collision_penalty 0.2 --success_bonus 20 --progress_scale 2.0 --distance_weight 0.2 --step_size 0.25 --goal_eps 0.2
 .venv/Scripts/python eval.py --env nav --policy nocomm --checkpoint checkpoints/nocomm.pt --agents 3 --hidden 64 --comm_steps 2 --vision 0.3 --spawn_span 0.6 --collision_penalty 0.2 --success_bonus 20 --progress_scale 2.0 --distance_weight 0.2 --step_size 0.25 --goal_eps 0.2
 ```
