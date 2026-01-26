@@ -1,7 +1,10 @@
 # CommNet Reproduction (NIPS 2016)
 
-Minimal reproduction of "Learning Multiagent Communication with Backpropagation" with a custom navigation task and a lever-pulling task from the paper. Implements:
-- Custom cooperative navigation environment (`envs/coop_nav_env.py`)
+Minimal reproduction of "Learning Multiagent Communication with Backpropagation" with environments from the paper. Implements:
+- Cooperative navigation environment (`envs/coop_nav_env.py`)
+- Lever-pulling coordination game (`envs/lever_game_env.py`)
+- Traffic junction environment (`envs/traffic_junction_env.py`)
+- Predator-prey hunting environment (`envs/predator_prey_env.py`)
 - CommNet policy with continuous differentiable communication (`models/commnet.py`)
 - No-communication baseline (same architecture, comm disabled)
 - REINFORCE with learned baseline, training/eval scripts, plotting utilities
@@ -21,7 +24,7 @@ Trains CommNet and NoComm sequentially, saves checkpoints and a reward plot.
 .venv/Scripts/python train.py --env nav --episodes 2000 --agents 3 --comm_steps 2 --plot_path plots/commnet_vs_nocomm.png
 ```
 Key flags:
-- `--env`: which environment (`nav` for navigation, `lever` for lever game)
+- `--env`: which environment (`nav` for navigation, `lever` for lever game, `traffic` for traffic junction, `prey` for predator-prey)
 - `--episodes`: training episodes per model
 - `--agents`: number of agents J
 - `--comm_steps`: communication layers K
@@ -49,6 +52,12 @@ Key flags:
 - `--lever_oracle`: use deterministic lever oracle during evaluation (comm-only, diagnostic)
 - `--no_encoder_activation`: disable encoder tanh (useful for lever)
 - `--no_comm_activation`: disable comm layer tanh (useful for lever)
+- `--grid_size`: grid size for traffic/prey environments (default: 7)
+- `--vision_range`: vision range for traffic/prey environments (default: 2)
+- `--spawn_mode`: spawn mode for traffic junction (`corners` or `random`, default: `corners`)
+- `--num_prey`: number of prey in predator-prey environment (default: 1)
+- `--catch_radius`: catch radius for predator-prey (default: 1.0)
+- `--prey_move_prob`: probability prey moves each step (default: 0.5)
 
 Outputs:
 - Checkpoints: `checkpoints/commnet.pt`, `checkpoints/nocomm.pt`
@@ -63,6 +72,12 @@ Run a saved policy. By default actions are sampled; add `--greedy` to use argmax
 # Lever game
 .venv/Scripts/python eval.py --env lever --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50 --greedy
 .venv/Scripts/python eval.py --env lever --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50
+
+# Traffic junction
+.venv/Scripts/python eval.py --env traffic --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50 --greedy
+
+# Predator-prey
+.venv/Scripts/python eval.py --env prey --policy commnet --checkpoint checkpoints/commnet.pt --episodes 50 --greedy
 ```
 Reports mean return and success rate (all agents within goal tolerance).
 
@@ -77,6 +92,24 @@ Reports mean return and success rate (all agents within goal tolerance).
   - Pool of N agent IDs (pool_size); each episode samples M active agents (agents). Each active agent observes only its own ID (one-hot over pool_size).
   - Each agent chooses a lever simultaneously; reward = (# distinct levers chosen) / m (num_levers). Episode is one step.
 
+- Traffic junction (`envs/traffic_junction_env.py`):
+  - Grid-based environment where agents (cars) must coordinate to cross intersections without collisions.
+  - Agents spawn at corners/edges and need to reach opposite corners/edges.
+  - Observations: local grid view around agent (vision_range×vision_range) + normalized position + goal position.
+  - Actions: discrete moves {stay, up, down, left, right} on grid.
+  - Reward: success bonus when all agents reach goals, minus collision penalties and time penalty.
+  - Collision handling: if multiple agents try to move to same cell, none move (stay in place).
+  - Episode ends when all agents reach goals or max_steps reached.
+
+- Predator-prey (`envs/predator_prey_env.py`):
+  - Grid-based hunting environment where predators (agents) must coordinate to catch prey.
+  - Predators spawn randomly and need to surround/catch prey (within catch_radius).
+  - Observations: local grid view around predator (vision_range×vision_range) + normalized position.
+  - Actions: discrete moves {stay, up, down, left, right} on grid.
+  - Reward: success bonus when all prey are caught (requires ≥2 predators within catch_radius), minus time penalty and collision penalties.
+  - Prey moves randomly with configurable probability (prey_move_prob).
+  - Episode ends when all prey are caught or max_steps reached.
+
 ## Recommended runs
 Navigation (moderate difficulty, fair comparison):
 ```bash
@@ -90,6 +123,18 @@ Lever (rank features, greedy eval):
 .venv/Scripts/python train.py --env lever --agents 5 --pool_size 50 --num_levers 5 --hidden 128 --comm_steps 2 --episodes 400 --lever_supervised --lever_batch 256 --lever_identity_encoder --lever_rank_features --no_encoder_activation --comm_mlp --comm_mlp_hidden 256 --plot_path plots/lever_commnet_vs_nocomm.png
 .venv/Scripts/python eval.py --env lever --policy commnet --checkpoint checkpoints/commnet.pt --agents 5 --pool_size 50 --num_levers 5 --hidden 128 --comm_steps 2 --lever_identity_encoder --lever_rank_features --no_encoder_activation --comm_mlp --comm_mlp_hidden 256 --greedy
 .venv/Scripts/python eval.py --env lever --policy nocomm --checkpoint checkpoints/nocomm.pt --agents 5 --pool_size 50 --num_levers 5 --hidden 128 --comm_steps 2 --lever_identity_encoder --lever_rank_features --no_encoder_activation --comm_mlp --comm_mlp_hidden 256 --greedy
+```
+
+Traffic junction:
+```bash
+.venv/Scripts/python train.py --env traffic --episodes 2000 --agents 5 --grid_size 7 --vision_range 2 --max_steps 40 --collision_penalty 0.5 --success_bonus 10 --time_penalty 0.1 --spawn_mode corners --plot_path plots/traffic_commnet_vs_nocomm.png
+.venv/Scripts/python eval.py --env traffic --policy commnet --checkpoint checkpoints/commnet.pt --agents 5 --grid_size 7 --vision_range 2 --max_steps 40 --collision_penalty 0.5 --success_bonus 10 --time_penalty 0.1 --spawn_mode corners --greedy
+```
+
+Predator-prey:
+```bash
+.venv/Scripts/python train.py --env prey --episodes 2000 --agents 3 --num_prey 1 --grid_size 7 --vision_range 2 --max_steps 40 --catch_radius 1.0 --success_bonus 10 --time_penalty 0.1 --prey_move_prob 0.5 --collision_penalty 0.2 --plot_path plots/prey_commnet_vs_nocomm.png
+.venv/Scripts/python eval.py --env prey --policy commnet --checkpoint checkpoints/commnet.pt --agents 3 --num_prey 1 --grid_size 7 --vision_range 2 --max_steps 40 --catch_radius 1.0 --success_bonus 10 --time_penalty 0.1 --prey_move_prob 0.5 --collision_penalty 0.2 --greedy
 ```
 
 ## Troubleshooting

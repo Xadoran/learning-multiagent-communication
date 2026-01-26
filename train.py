@@ -9,11 +9,13 @@ import torch.optim as optim
 
 from envs.coop_nav_env import CooperativeNavEnv
 from envs.lever_game_env import LeverGameEnv
+from envs.traffic_junction_env import TrafficJunctionEnv
+from envs.predator_prey_env import PredatorPreyEnv
 from models.commnet import CommNetPolicy
 from utils import compute_returns, plot_rewards
 
 
-def rollout_episode(env: CooperativeNavEnv, policy: CommNetPolicy, gamma: float):
+def rollout_episode(env, policy: CommNetPolicy, gamma: float):
     obs = env.reset()
     rewards: List[float] = []
     logprob_totals: List[torch.Tensor] = []
@@ -48,7 +50,7 @@ def rollout_episode(env: CooperativeNavEnv, policy: CommNetPolicy, gamma: float)
 
 def train_policy(
     episodes: int,
-    env: CooperativeNavEnv,
+    env,
     policy: CommNetPolicy,
     lr: float = 3e-4,
     gamma: float = 0.99,
@@ -136,7 +138,7 @@ def train_lever_supervised(
 def main():
     parser = argparse.ArgumentParser(description="Train CommNet vs no-comm baseline.")
     parser.add_argument("--episodes", type=int, default=2000)
-    parser.add_argument("--env", choices=["nav", "lever"], default="nav")
+    parser.add_argument("--env", choices=["nav", "lever", "traffic", "prey"], default="nav")
     parser.add_argument("--agents", type=int, default=3)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--comm_steps", type=int, default=2)
@@ -164,6 +166,14 @@ def main():
     parser.add_argument("--lever_rank_features", action="store_true", help="Add prefix-sum rank features for lever game (requires identity encoder)")
     parser.add_argument("--no_encoder_activation", action="store_true", help="Disable encoder tanh activation (useful for lever)")
     parser.add_argument("--no_comm_activation", action="store_true", help="Disable comm layer tanh activation (useful for lever)")
+    # Traffic junction args
+    parser.add_argument("--grid_size", type=int, default=7, help="Grid size for traffic/prey environments")
+    parser.add_argument("--vision_range", type=int, default=2, help="Vision range for traffic/prey environments")
+    parser.add_argument("--spawn_mode", type=str, default="corners", choices=["corners", "random"], help="Spawn mode for traffic junction")
+    # Predator-prey args
+    parser.add_argument("--num_prey", type=int, default=1, help="Number of prey in predator-prey environment")
+    parser.add_argument("--catch_radius", type=float, default=1.0, help="Catch radius for predator-prey")
+    parser.add_argument("--prey_move_prob", type=float, default=0.5, help="Probability prey moves each step")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
@@ -186,13 +196,41 @@ def main():
             distance_weight=args.distance_weight,
             seed=args.seed,
         )
-    else:
+    elif args.env == "lever":
         env = LeverGameEnv(
             pool_size=args.pool_size,
             active_agents=args.agents,
             num_levers=args.num_levers,
             seed=args.seed,
         )
+    elif args.env == "traffic":
+        env = TrafficJunctionEnv(
+            grid_size=args.grid_size,
+            num_agents=args.agents,
+            max_steps=args.max_steps,
+            vision_range=args.vision_range,
+            collision_penalty=args.collision_penalty,
+            success_bonus=args.success_bonus,
+            time_penalty=args.time_penalty,
+            spawn_mode=args.spawn_mode,
+            seed=args.seed,
+        )
+    elif args.env == "prey":
+        env = PredatorPreyEnv(
+            grid_size=args.grid_size,
+            num_predators=args.agents,
+            num_prey=args.num_prey,
+            max_steps=args.max_steps,
+            vision_range=args.vision_range,
+            catch_radius=args.catch_radius,
+            success_bonus=args.success_bonus,
+            time_penalty=args.time_penalty,
+            prey_move_prob=args.prey_move_prob,
+            collision_penalty=args.collision_penalty,
+            seed=args.seed,
+        )
+    else:
+        raise ValueError(f"Unknown environment: {args.env}")
 
     # Select training function
     use_supervised_lever = args.env == "lever" and args.lever_supervised
