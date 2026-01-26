@@ -56,28 +56,73 @@ def train_policy(
     gamma: float = 0.99,
     alpha_value: float = 0.03,
     entropy_beta: float = 0.01,
+    batch_size: int = 1,
 ):
+    """
+    Train policy using REINFORCE with baseline.
+    
+    Args:
+        episodes: Total number of episodes to train
+        env: Environment instance
+        policy: CommNet policy network
+        lr: Learning rate
+        gamma: Discount factor
+        alpha_value: Weight for value loss
+        entropy_beta: Entropy bonus coefficient
+        batch_size: Number of episodes to collect before updating (default: 1 for single-episode updates)
+    """
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
     episode_returns: List[float] = []
 
     for ep in range(episodes):
-        returns, advantages, baselines, logprob_totals, entropies, ep_ret = rollout_episode(
-            env, policy, gamma
-        )
-        policy_loss = -(logprob_totals * advantages).sum() - entropy_beta * entropies.mean()
-        value_loss = mse_loss(baselines, returns)
-        loss = policy_loss + alpha_value * value_loss
+        # Collect batch of episodes
+        batch_returns = []
+        batch_advantages = []
+        batch_baselines = []
+        batch_logprob_totals = []
+        batch_entropies = []
+        batch_ep_returns = []
+
+        for _ in range(batch_size):
+            returns, advantages, baselines, logprob_totals, entropies, ep_ret = rollout_episode(
+                env, policy, gamma
+            )
+            batch_returns.append(returns)
+            batch_advantages.append(advantages)
+            batch_baselines.append(baselines)
+            batch_logprob_totals.append(logprob_totals)
+            batch_entropies.append(entropies)
+            batch_ep_returns.append(ep_ret)
+
+        # Aggregate losses across batch
+        # Average policy loss across episodes
+        policy_losses = []
+        value_losses = []
+        for i in range(batch_size):
+            policy_loss = -(batch_logprob_totals[i] * batch_advantages[i]).sum() - entropy_beta * batch_entropies[i].mean()
+            value_loss = mse_loss(batch_baselines[i], batch_returns[i])
+            policy_losses.append(policy_loss)
+            value_losses.append(value_loss)
+
+        # Average losses across batch
+        total_policy_loss = sum(policy_losses) / batch_size
+        total_value_loss = sum(value_losses) / batch_size
+        loss = total_policy_loss + alpha_value * total_value_loss
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
 
-        episode_returns.append(ep_ret)
-        if (ep + 1) % 100 == 0:
-            avg_last = np.mean(episode_returns[-100:])
-            print(f"Episode {ep+1}/{episodes} | avg return (last 100): {avg_last:.3f}")
+        # Record all episode returns
+        episode_returns.extend(batch_ep_returns)
+        
+        if (ep + 1) % max(1, 100 // batch_size) == 0:
+            avg_last = np.mean(episode_returns[-100:]) if len(episode_returns) >= 100 else np.mean(episode_returns)
+            total_episodes = len(episode_returns)
+            print(f"Episode {ep+1}/{episodes} (total: {total_episodes}) | avg return (last 100): {avg_last:.3f} | batch_size: {batch_size}")
+    
     return episode_returns
 
 
@@ -174,6 +219,7 @@ def main():
     parser.add_argument("--num_prey", type=int, default=1, help="Number of prey in predator-prey environment")
     parser.add_argument("--catch_radius", type=float, default=1.0, help="Catch radius for predator-prey")
     parser.add_argument("--prey_move_prob", type=float, default=0.5, help="Probability prey moves each step")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for RL training (number of episodes per update, default: 1)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
@@ -268,6 +314,7 @@ def main():
             gamma=args.gamma,
             alpha_value=args.alpha_value,
             entropy_beta=args.entropy_beta,
+            batch_size=args.batch_size,
         )
 
     # No-communication baseline
@@ -302,6 +349,7 @@ def main():
             gamma=args.gamma,
             alpha_value=args.alpha_value,
             entropy_beta=args.entropy_beta,
+            batch_size=args.batch_size,
         )
 
     os.makedirs("checkpoints", exist_ok=True)
