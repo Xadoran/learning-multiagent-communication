@@ -3,222 +3,414 @@ import numpy as np
 
 class TrafficJunctionEnv:
     """
-    Traffic Junction coordination environment (CommNet paper).
-    - Grid-based environment where agents (cars) must coordinate to cross intersections.
-    - Agents spawn at different entry points and need to reach exit points.
-    - Collision penalty for agents occupying the same cell.
-    - Partial observability: agents observe local grid around them.
-    - Shared reward: success bonus when all agents reach goals, minus collision penalties.
+    Traffic Junction task (CommNet, NIPS 2016) implemented in a fixed-slot way.
+
+    Paper spec (core points):
+    - 14x14 grid, 4-way junction.
+    - New cars arrive each time step with probability p_arrive from each direction,
+      capped by Nmax cars present.
+    - Each car assigned to one of 3 routes (right turn / straight / left turn), and
+      has 2 actions: GAS (advance 1 along route) or BRAKE (stay).
+    - Collision if two cars overlap -> r_coll = -10 per collision event.
+      Collision does not affect simulation otherwise, but the episode is a failure if
+      >=1 collision occurred in the 40-step horizon.
+    - Time penalty: for each car i present at time t, add tau_i * r_time where
+      r_time = -0.01 and tau_i is time since the car arrived.
+
+    Compatibility choices (to fit your current train loop):
+    - We keep a fixed number of agent slots = Nmax. "Inactive" slots represent no car.
+    - Actions for inactive slots are ignored.
+    - Observation is fixed-size per slot; slots that are inactive emit all-zeros.
+
+    Observation (per slot):
+    - present flag (1)
+    - self ID one-hot (Nmax)
+    - self location one-hot (grid_size*grid_size)
+    - self route one-hot (3)
+    - self tau normalized scalar (1)
+    - local 3x3 neighborhood features (9 cells):
+        for each cell: neighbor_present(1) + neighbor_id_onehot(Nmax) + neighbor_route_onehot(3)
+      (masked to 0 if empty / out of bounds)
+
+    Reward:
+      r(t) = C_t * r_coll + sum_{cars i present} tau_i * r_time
+      where C_t is the number of pairwise collisions at time t.
+
+    Done:
+      - after max_steps=40
+      - info['failure'] True iff any collision occurred at any time
     """
 
-    # Actions: stay, up, down, left, right
-    ACTIONS = np.array(
-        [
-            [0, 0],   # stay
-            [0, 1],   # up
-            [0, -1],  # down
-            [-1, 0],  # left
-            [1, 0],   # right
-        ],
-        dtype=np.int32,
-    )
+    # Actions
+    BRAKE = 0
+    GAS = 1
 
     def __init__(
         self,
-        grid_size: int = 7,
-        num_agents: int = 5,
+        grid_size: int = 14,
+        nmax: int = 10,
         max_steps: int = 40,
-        vision_range: int = 2,
-        collision_penalty: float = 0.5,
-        success_bonus: float = 10.0,
-        time_penalty: float = 0.1,
-        spawn_mode: str = "corners",  # "corners" or "random"
+        p_arrive: float = 0.2,
+        r_coll: float = -10.0,
+        r_time: float = -0.01,
+        vision_range: int = 1,  # 3x3 neighborhood
         seed: int | None = None,
     ):
+        assert grid_size == 14, "CommNet paper uses 14x14 for Traffic Junction"
+        assert vision_range == 1, "CommNet paper uses 3x3 neighborhood (vision_range=1)"
+
         self.grid_size = grid_size
-        self.num_agents = num_agents
+        self.nmax = nmax
         self.max_steps = max_steps
+        self.p_arrive = float(p_arrive)
+        self.r_coll = float(r_coll)
+        self.r_time = float(r_time)
         self.vision_range = vision_range
-        self.collision_penalty = collision_penalty
-        self.success_bonus = success_bonus
-        self.time_penalty = time_penalty
-        self.spawn_mode = spawn_mode
         self.rng = np.random.default_rng(seed)
 
-        # Observation: local grid view (vision_range*2+1)^2 + own position (2) + goal position (2)
-        obs_grid_size = (2 * vision_range + 1) ** 2
-        self.obs_dim = obs_grid_size + 2 + 2  # grid view + pos + goal
-        self.action_dim = len(self.ACTIONS)
+        # Fixed action space: brake/gas
+        self.action_dim = 2
 
-        # State
-        self.positions = np.zeros((num_agents, 2), dtype=np.int32)
-        self.goals = np.zeros((num_agents, 2), dtype=np.int32)
-        self.grid = np.zeros((grid_size, grid_size), dtype=np.int32)  # 0=empty, >0=agent_id
+        # Obs dims
+        self.id_dim = self.nmax
+        self.loc_dim = self.grid_size * self.grid_size
+        self.route_dim = 3
+
+        # per neighbor cell: present(1) + id_onehot(Nmax) + route_onehot(3)
+        self.nei_cell_dim = 1 + self.id_dim + self.route_dim
+        self.nei_dim = (
+            2 * self.vision_range + 1
+        ) ** 2 * self.nei_cell_dim  # 9 * cell_dim
+
+        # per agent:
+        # present(1) + id_onehot + loc_onehot + route_onehot + tau_scalar(1) + neighborhood
+        self.obs_dim = (
+            1 + self.id_dim + self.loc_dim + self.route_dim + 1 + self.nei_dim
+        )
+
+        # State arrays for fixed slots
+        self.present = np.zeros((self.nmax,), dtype=np.bool_)
+        self.pos = np.zeros((self.nmax, 2), dtype=np.int32)  # (x,y)
+        self.route_id = np.zeros((self.nmax,), dtype=np.int32)  # 0..2
+        self.route_idx = np.zeros(
+            (self.nmax,), dtype=np.int32
+        )  # index along route path
+        self.tau = np.zeros((self.nmax,), dtype=np.int32)  # time since arrival
+
         self.t = 0
+        self.any_collision = False
+
+        # Precompute routes: for each entry dir and route_id -> list of cells (x,y)
+        # Entry points are placed around the intersection centered near grid center.
+        self._routes = self._build_all_routes()
 
     def reset(self):
-        """Reset environment and return initial observations."""
-        self.positions = np.zeros((self.num_agents, 2), dtype=np.int32)
-        self.goals = np.zeros((self.num_agents, 2), dtype=np.int32)
-        self.grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+        self.present.fill(False)
+        self.pos.fill(0)
+        self.route_id.fill(0)
+        self.route_idx.fill(0)
+        self.tau.fill(0)
+
         self.t = 0
+        self.any_collision = False
 
-        if self.spawn_mode == "corners":
-            # Spawn agents at corners, goals at opposite corners
-            corners = [
-                (0, 0),
-                (0, self.grid_size - 1),
-                (self.grid_size - 1, 0),
-                (self.grid_size - 1, self.grid_size - 1),
-            ]
-            # Use center if more agents than corners
-            if self.num_agents > 4:
-                corners.append((self.grid_size // 2, self.grid_size // 2))
-
-            for i in range(self.num_agents):
-                corner_idx = i % len(corners)
-                self.positions[i] = corners[corner_idx]
-                # Goal is opposite corner
-                opp_corner = corners[(corner_idx + 2) % len(corners)]
-                self.goals[i] = opp_corner
-        else:
-            # Random spawn
-            for i in range(self.num_agents):
-                # Spawn at edges
-                side = self.rng.integers(4)
-                if side == 0:  # top
-                    self.positions[i] = [self.rng.integers(self.grid_size), 0]
-                elif side == 1:  # bottom
-                    self.positions[i] = [self.rng.integers(self.grid_size), self.grid_size - 1]
-                elif side == 2:  # left
-                    self.positions[i] = [0, self.rng.integers(self.grid_size)]
-                else:  # right
-                    self.positions[i] = [self.grid_size - 1, self.rng.integers(self.grid_size)]
-
-                # Goal on opposite side
-                if side == 0:  # goal at bottom
-                    self.goals[i] = [self.rng.integers(self.grid_size), self.grid_size - 1]
-                elif side == 1:  # goal at top
-                    self.goals[i] = [self.rng.integers(self.grid_size), 0]
-                elif side == 2:  # goal at right
-                    self.goals[i] = [self.grid_size - 1, self.rng.integers(self.grid_size)]
-                else:  # goal at left
-                    self.goals[i] = [0, self.rng.integers(self.grid_size)]
-
-        # Update grid
-        self._update_grid()
+        # Optionally spawn a few cars at start (paper depicts ongoing arrivals;
+        # starting empty is fine). We'll start empty.
         return self._get_obs()
 
     def step(self, actions: np.ndarray):
-        """Execute one step in the environment."""
         actions = np.asarray(actions, dtype=np.int64)
-        assert actions.shape == (self.num_agents,)
+        assert actions.shape == (self.nmax,)
 
-        # Clear grid
-        self.grid.fill(0)
+        # 1) Arrivals (up to 4 directions), constrained by Nmax
+        self._spawn_arrivals()
 
-        # Move agents (with collision detection)
-        new_positions = np.copy(self.positions)
-        for i in range(self.num_agents):
-            action = self.ACTIONS[actions[i]]
-            new_pos = self.positions[i] + action
-            # Clip to grid bounds
-            new_pos = np.clip(new_pos, 0, self.grid_size - 1)
-            new_positions[i] = new_pos
+        # 2) Apply actions (simultaneous): move GAS cars forward by 1 along their route
+        #    BRAKE does nothing. Inactive slots ignored.
+        new_pos = self.pos.copy()
+        new_route_idx = self.route_idx.copy()
 
-        # Resolve collisions: if multiple agents want same cell, none move
-        collision_map = {}
-        for i in range(self.num_agents):
-            pos_key = tuple(new_positions[i])
-            if pos_key not in collision_map:
-                collision_map[pos_key] = []
-            collision_map[pos_key].append(i)
+        for i in range(self.nmax):
+            if not self.present[i]:
+                continue
+            a = int(actions[i])
+            if a == self.GAS:
+                rid = int(self.route_id[i])
+                entry = self._infer_entry_from_route(self._route_key_for_slot(i))
+                path = self._routes[(entry, rid)]
+                nxt = int(self.route_idx[i]) + 1
+                if nxt < len(path):
+                    new_route_idx[i] = nxt
+                    new_pos[i] = path[nxt]
+                else:
+                    # Already at end: will be removed below
+                    pass
+            # BRAKE => stay
 
-        # Only agents with unique target positions can move
-        for pos_key, agent_ids in collision_map.items():
-            if len(agent_ids) == 1:
-                self.positions[agent_ids[0]] = new_positions[agent_ids[0]]
-            # else: collision, agents stay in place
+        # Commit movement
+        self.pos[:] = new_pos
+        self.route_idx[:] = new_route_idx
 
-        self._update_grid()
+        # 3) Remove cars that reached end of their path (exited grid)
+        self._remove_exited()
+
+        # 4) Compute collisions at current time step (pairwise overlaps)
+        c_t = self._count_pairwise_collisions()
+        if c_t > 0:
+            self.any_collision = True
+
+        # 5) Time penalties and tau update
+        # Reward uses tau at this time step (time since arrival).
+        time_pen = 0.0
+        for i in range(self.nmax):
+            if self.present[i]:
+                time_pen += float(self.tau[i]) * self.r_time
+
+        reward = float(c_t) * self.r_coll + float(time_pen)
+
+        # Increase tau for cars still present
+        for i in range(self.nmax):
+            if self.present[i]:
+                self.tau[i] += 1
+
         self.t += 1
+        done = self.t >= self.max_steps
 
-        reward, done, info = self._compute_reward_done()
+        info = {
+            "collisions_t": int(c_t),
+            "failure": bool(self.any_collision),
+            "cars_present": int(self.present.sum()),
+            "success": bool(done and not self.any_collision),
+        }
+
         obs = self._get_obs()
         return obs, reward, done, info
 
-    def _update_grid(self):
-        """Update grid state with current agent positions."""
-        self.grid.fill(0)
-        for i in range(self.num_agents):
-            x, y = self.positions[i]
-            if 0 <= x < self.grid_size and 0 <= y < self.grid_size:
-                self.grid[y, x] = i + 1  # 1-indexed for agent ID
+    def sample_random_action(self):
+        return self.rng.integers(0, self.action_dim, size=(self.nmax,), dtype=np.int64)
 
-    def _compute_reward_done(self):
-        """Compute reward and done flag."""
-        # Check collisions (multiple agents in same cell)
-        collision_count = 0
-        for i in range(self.num_agents):
-            x, y = self.positions[i]
-            if self.grid[y, x] > 1:  # More than one agent (value > 1 means collision)
-                collision_count += 1
+    # -------------------------
+    # Internal helpers
+    # -------------------------
 
-        collision_penalty = self.collision_penalty * collision_count
+    def _spawn_arrivals(self):
+        # Directions: N,S,W,E (cars enter from edge heading toward junction)
+        # We'll attempt arrivals from each direction with p_arrive.
+        directions = ["N", "S", "W", "E"]
+        for d in directions:
+            if self.present.sum() >= self.nmax:
+                break
+            if self.rng.random() < self.p_arrive:
+                slot = self._first_free_slot()
+                if slot is None:
+                    break
+                rid = int(self.rng.integers(0, 3))  # 0..2 route id
+                path = self._routes[(d, rid)]
+                # spawn at path[0]
+                self.present[slot] = True
+                self.route_id[slot] = rid
+                self.route_idx[slot] = 0
+                self.pos[slot] = path[0]
+                self.tau[slot] = 0
+                # record route-key for this slot (direction is not otherwise stored)
+                self._set_route_key_for_slot(slot, d)
 
-        # Check if all agents reached goals
-        at_goals = np.all(self.positions == self.goals, axis=1)
-        all_at_goals = np.all(at_goals)
+    def _first_free_slot(self):
+        free = np.where(~self.present)[0]
+        return int(free[0]) if free.size > 0 else None
 
-        reward = -self.time_penalty - collision_penalty
-        if all_at_goals:
-            reward += self.success_bonus
+    def _remove_exited(self):
+        # A car exits when it reaches the last cell in its path and GAS again would go out.
+        # Here we remove if route_idx is already at the final cell.
+        for i in range(self.nmax):
+            if not self.present[i]:
+                continue
+            d = self._route_key_for_slot(i)
+            rid = int(self.route_id[i])
+            path = self._routes[(d, rid)]
+            if int(self.route_idx[i]) >= len(path) - 1:
+                # remove
+                self.present[i] = False
+                self.pos[i] = 0
+                self.route_idx[i] = 0
+                self.route_id[i] = 0
+                self.tau[i] = 0
+                self._set_route_key_for_slot(i, "N")  # default placeholder
 
-        done = all_at_goals or self.t >= self.max_steps
-
-        info = {
-            "collisions": collision_count,
-            "at_goals": int(np.sum(at_goals)),
-            "success": all_at_goals,
-        }
-        return reward, done, info
+    def _count_pairwise_collisions(self) -> int:
+        # Count pairwise collisions at this time step:
+        # if k cars occupy same cell -> k choose 2 collisions.
+        coords = {}
+        for i in range(self.nmax):
+            if not self.present[i]:
+                continue
+            key = (int(self.pos[i][0]), int(self.pos[i][1]))
+            coords[key] = coords.get(key, 0) + 1
+        c = 0
+        for k in coords.values():
+            if k >= 2:
+                c += k * (k - 1) // 2
+        return int(c)
 
     def _get_obs(self):
-        """Get observations for all agents."""
-        obs = []
-        for i in range(self.num_agents):
-            # Local grid view around agent
-            x, y = self.positions[i]
-            grid_view = np.zeros((2 * self.vision_range + 1, 2 * self.vision_range + 1), dtype=np.float32)
+        obs = np.zeros((self.nmax, self.obs_dim), dtype=np.float32)
 
+        for i in range(self.nmax):
+            if not self.present[i]:
+                continue
+
+            feats = []
+
+            # present
+            feats.append(np.array([1.0], dtype=np.float32))
+
+            # id one-hot (slot index is the unique ID in this fixed-slot version)
+            id_oh = np.zeros((self.id_dim,), dtype=np.float32)
+            id_oh[i] = 1.0
+            feats.append(id_oh)
+
+            # location one-hot
+            loc_oh = np.zeros((self.loc_dim,), dtype=np.float32)
+            x, y = int(self.pos[i][0]), int(self.pos[i][1])
+            loc_oh[y * self.grid_size + x] = 1.0
+            feats.append(loc_oh)
+
+            # route one-hot
+            r_oh = np.zeros((self.route_dim,), dtype=np.float32)
+            r_oh[int(self.route_id[i])] = 1.0
+            feats.append(r_oh)
+
+            # tau normalized (divide by max_steps)
+            feats.append(
+                np.array([float(self.tau[i]) / float(self.max_steps)], dtype=np.float32)
+            )
+
+            # neighborhood (3x3)
+            neigh = []
+            cx, cy = x, y
             for dy in range(-self.vision_range, self.vision_range + 1):
                 for dx in range(-self.vision_range, self.vision_range + 1):
-                    gx, gy = x + dx, y + dy
+                    gx, gy = cx + dx, cy + dy
+                    cell = np.zeros((self.nei_cell_dim,), dtype=np.float32)
                     if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
-                        # Encode: 0=empty, 1=other agent, 2=goal
-                        if self.grid[gy, gx] > 0:
-                            if self.grid[gy, gx] == i + 1:
-                                grid_view[dy + self.vision_range, dx + self.vision_range] = 0.0  # self
-                            else:
-                                grid_view[dy + self.vision_range, dx + self.vision_range] = 1.0  # other agent
-                        elif gx == self.goals[i][0] and gy == self.goals[i][1]:
-                            grid_view[dy + self.vision_range, dx + self.vision_range] = 2.0  # goal
-                        else:
-                            grid_view[dy + self.vision_range, dx + self.vision_range] = 0.0  # empty
-                    # else: out of bounds, stays 0
+                        # find if another car occupies that cell
+                        occ = self._car_at_cell_excluding(gx, gy, exclude=i)
+                        if occ is not None:
+                            cell[0] = 1.0  # neighbor_present
+                            nid = np.zeros((self.id_dim,), dtype=np.float32)
+                            nid[occ] = 1.0
+                            cell[1 : 1 + self.id_dim] = nid
+                            nr = np.zeros((self.route_dim,), dtype=np.float32)
+                            nr[int(self.route_id[occ])] = 1.0
+                            cell[1 + self.id_dim :] = nr
+                    neigh.append(cell)
+            feats.append(np.concatenate(neigh, axis=0))
 
-            # Flatten grid view
-            grid_flat = grid_view.flatten()
+            obs[i] = np.concatenate(feats, axis=0)
 
-            # Normalize positions to [0, 1]
-            pos_norm = self.positions[i].astype(np.float32) / self.grid_size
-            goal_norm = self.goals[i].astype(np.float32) / self.grid_size
+        return obs
 
-            obs_i = np.concatenate([grid_flat, pos_norm, goal_norm], axis=0)
-            obs.append(obs_i)
+    def _car_at_cell_excluding(self, x: int, y: int, exclude: int):
+        for j in range(self.nmax):
+            if j == exclude or not self.present[j]:
+                continue
+            if int(self.pos[j][0]) == x and int(self.pos[j][1]) == y:
+                return j
+        return None
 
-        return np.stack(obs, axis=0)
+    # --- Route construction (simple right-hand lanes) ---
 
-    def sample_random_action(self):
-        """Sample random actions for all agents."""
-        return self.rng.integers(0, self.action_dim, size=(self.num_agents,), dtype=np.int64)
+    def _build_all_routes(self):
+        # We build 3 route types from each entry direction:
+        # 0: right turn, 1: straight, 2: left turn
+        # (This matches “3 possible routes” in the paper.) :contentReference[oaicite:2]{index=2}
+        routes = {}
+        for d in ["N", "S", "W", "E"]:
+            for rid in [0, 1, 2]:
+                routes[(d, rid)] = self._build_route(d, rid)
+        return routes
+
+    def _build_route(self, entry: str, rid: int):
+        """
+        Returns a list of (x,y) cells describing the route path.
+        This is a lightweight implementation: single-lane roads through the center.
+        """
+        g = self.grid_size
+        cx = g // 2  # 7
+        cy = g // 2  # 7
+
+        # We'll place lanes slightly offset to keep "right-hand side" behavior consistent.
+        # Using two center lines: vertical lane at x=cx-1, horizontal lane at y=cy-1.
+        vx = cx - 1
+        hy = cy - 1
+
+        path = []
+
+        if entry == "N":
+            # spawn at top going down
+            x0, y0 = vx, 0
+            if rid == 0:  # right turn: N -> W
+                # down to junction then left to edge
+                path += [(x0, y) for y in range(y0, hy + 1)]
+                path += [(x, hy) for x in range(x0 - 1, -1, -1)]
+            elif rid == 1:  # straight: N -> S
+                path += [(x0, y) for y in range(y0, g)]
+            else:  # left turn: N -> E
+                path += [(x0, y) for y in range(y0, hy + 1)]
+                path += [(x, hy) for x in range(x0 + 1, g)]
+        elif entry == "S":
+            x0, y0 = cx, g - 1
+            if rid == 0:  # right turn: S -> E
+                path += [(x0, y) for y in range(y0, hy - 1, -1)]
+                path += [(x, hy) for x in range(x0 + 1, g)]
+            elif rid == 1:  # straight: S -> N
+                path += [(x0, y) for y in range(y0, -1, -1)]
+            else:  # left turn: S -> W
+                path += [(x0, y) for y in range(y0, hy - 1, -1)]
+                path += [(x, hy) for x in range(x0 - 1, -1, -1)]
+        elif entry == "W":
+            x0, y0 = 0, hy
+            if rid == 0:  # right turn: W -> N
+                path += [(x, y0) for x in range(x0, vx + 1)]
+                path += [(vx, y) for y in range(y0 - 1, -1, -1)]
+            elif rid == 1:  # straight: W -> E
+                path += [(x, y0) for x in range(x0, g)]
+            else:  # left turn: W -> S
+                path += [(x, y0) for x in range(x0, vx + 1)]
+                path += [(vx, y) for y in range(y0 + 1, g)]
+        else:  # entry == "E"
+            x0, y0 = g - 1, cy
+            if rid == 0:  # right turn: E -> S
+                path += [(x, y0) for x in range(x0, vx - 1, -1)]
+                path += [(vx, y) for y in range(y0 + 1, g)]
+            elif rid == 1:  # straight: E -> W
+                path += [(x, y0) for x in range(x0, -1, -1)]
+            else:  # left turn: E -> N
+                path += [(x, y0) for x in range(x0, vx - 1, -1)]
+                path += [(vx, y) for y in range(y0 - 1, -1, -1)]
+
+        # Ensure path stays within bounds and is at least length 2
+        path = [(int(x), int(y)) for (x, y) in path if 0 <= x < g and 0 <= y < g]
+        if len(path) < 2:
+            path = [(vx, 0), (vx, 1)]
+        return np.array(path, dtype=np.int32)
+
+    # --- We store entry direction per slot (since route path depends on entry) ---
+    # This keeps the env fully self-contained without extra arrays exposed.
+
+    def _init_route_keys(self):
+        self._slot_entry = np.array(["N"] * self.nmax, dtype=object)
+
+    def _route_key_for_slot(self, i: int) -> str:
+        if not hasattr(self, "_slot_entry"):
+            self._init_route_keys()
+        return str(self._slot_entry[i])
+
+    def _set_route_key_for_slot(self, i: int, entry: str):
+        if not hasattr(self, "_slot_entry"):
+            self._init_route_keys()
+        self._slot_entry[i] = entry
+
+    def _infer_entry_from_route(self, entry: str) -> str:
+        # stored already
+        return entry
