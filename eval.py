@@ -63,9 +63,11 @@ def main():
     parser.add_argument("--no_encoder_activation", action="store_true", help="Disable encoder tanh activation")
     parser.add_argument("--no_comm_activation", action="store_true", help="Disable comm layer tanh activation")
     # Traffic junction args
-    parser.add_argument("--grid_size", type=int, default=7, help="Grid size for traffic/prey environments")
-    parser.add_argument("--vision_range", type=int, default=2, help="Vision range for traffic/prey environments")
-    parser.add_argument("--spawn_mode", type=str, default="corners", choices=["corners", "random"], help="Spawn mode for traffic junction")
+    parser.add_argument("--grid_size", type=int, default=14, help="Grid size for traffic/prey environments")
+    parser.add_argument("--vision_range", type=int, default=1, help="Vision range for traffic/prey environments")
+    parser.add_argument("--p_arrive", type=float, default=0.2, help="Arrival probability per direction (traffic)")
+    parser.add_argument("--max_cars", type=int, default=10, help="Maximum number of cars (traffic)")
+    parser.add_argument("--at_goal_bonus", type=float, default=0.0, help="Per-agent bonus for reaching goal (traffic)")
     # Predator-prey args
     parser.add_argument("--num_prey", type=int, default=1, help="Number of prey in predator-prey environment")
     parser.add_argument("--catch_radius", type=float, default=1.0, help="Catch radius for predator-prey")
@@ -97,15 +99,15 @@ def main():
     elif args.env == "traffic":
         env = TrafficJunctionEnv(
             grid_size=args.grid_size,
-            num_agents=args.agents,
+            max_cars=args.max_cars,
             max_steps=args.max_steps,
+            p_arrive=args.p_arrive,
             vision_range=args.vision_range,
-            collision_penalty=args.collision_penalty,
-            success_bonus=args.success_bonus,
-            time_penalty=args.time_penalty,
-            spawn_mode=args.spawn_mode,
+            r_coll=-10.0,
+            r_time=-0.01,
             seed=args.seed,
         )
+        args.agents = args.max_cars
     elif args.env == "prey":
         env = PredatorPreyEnv(
             grid_size=args.grid_size,

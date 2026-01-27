@@ -59,6 +59,7 @@ class PredatorPreyEnv:
         self.prey_positions = np.zeros((num_prey, 2), dtype=np.int32)
         self.grid = np.zeros((grid_size, grid_size), dtype=np.int32)  # 0=empty, 1=predator, 2=prey
         self.t = 0
+        self.last_collision_count = 0
 
     def reset(self):
         """Reset environment and return initial observations."""
@@ -94,6 +95,7 @@ class PredatorPreyEnv:
                         break
 
         self._update_grid()
+        self.last_collision_count = 0
         return self._get_obs()
 
     def step(self, actions: np.ndarray):
@@ -121,9 +123,12 @@ class PredatorPreyEnv:
                 collision_map[pos_key] = []
             collision_map[pos_key].append(i)
 
+        collision_count = 0
         for pos_key, agent_ids in collision_map.items():
             if len(agent_ids) == 1:
                 self.predator_positions[agent_ids[0]] = new_predator_positions[agent_ids[0]]
+            else:
+                collision_count += len(agent_ids)
 
         # Move prey (random movement)
         for i in range(self.num_prey):
@@ -138,6 +143,7 @@ class PredatorPreyEnv:
 
         self._update_grid()
         self.t += 1
+        self.last_collision_count = collision_count
 
         reward, done, info = self._compute_reward_done()
         obs = self._get_obs()
@@ -173,14 +179,7 @@ class PredatorPreyEnv:
 
         all_caught = caught_count == self.num_prey
 
-        # Collision penalty for predators
-        collision_count = 0
-        for i in range(self.num_predators):
-            x, y = self.predator_positions[i]
-            if self.grid[y, x] > 1:  # Multiple predators in same cell
-                collision_count += 1
-
-        collision_penalty = self.collision_penalty * collision_count
+        collision_penalty = self.collision_penalty * self.last_collision_count
 
         reward = -self.time_penalty - collision_penalty
         if all_caught:
@@ -191,7 +190,7 @@ class PredatorPreyEnv:
         info = {
             "caught": caught_count,
             "success": all_caught,
-            "collisions": collision_count,
+            "collisions": self.last_collision_count,
         }
         return reward, done, info
 

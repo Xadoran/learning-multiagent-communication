@@ -39,6 +39,8 @@ Key flags:
 - `--step_size`: move step size (nav)
 - `--goal_eps`: success threshold (nav)
 - `--time_penalty`: per-step penalty (nav)
+- `--p_arrive`: arrival probability per direction (traffic)
+- `--max_cars`: maximum cars in traffic environment
 - `--alpha_value`: weight for value loss (baseline)
 - `--entropy_beta`: entropy bonus for exploration
 - `--pool_size`: lever game pool size (number of possible agent IDs)
@@ -116,6 +118,11 @@ Reports mean return and success rate (all agents within goal tolerance).
 - Lever game (`envs/lever_game_env.py`):
   - Pool of N agent IDs (pool_size); each episode samples M active agents (agents). Each active agent observes only its own ID (one-hot over pool_size).
   - Each agent chooses a lever simultaneously; reward = (# distinct levers chosen) / m (num_levers). Episode is one step.
+
+- Traffic junction (`envs/traffic_junction_env.py`):
+  - Grid-based 4-way intersection (14x14 default), cars spawn with probability `p_arrive` and follow fixed routes.
+  - Actions are gas/brake; collisions incur r_coll = -10; time penalty r_time = -0.01 per time since spawn.
+  - Suggested eval metric is collision-free rate (`success` = no collisions) and throughput (`exited`).
 
 - Traffic junction (`envs/traffic_junction_env.py`):
   - Grid-based environment where agents (cars) must coordinate to cross intersections without collisions.
