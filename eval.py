@@ -5,7 +5,7 @@ import torch
 from envs.coop_nav_env import CooperativeNavEnv
 from envs.lever_game_env import LeverGameEnv
 from envs.traffic_junction_env import TrafficJunctionEnv
-from envs.predator_prey_env import PredatorPreyEnv
+from envs.combat_env import CombatEnv
 from models.commnet import CommNetPolicy
 
 
@@ -17,6 +17,7 @@ def evaluate(policy: CommNetPolicy, env, episodes: int = 50, greedy: bool = True
         obs = env.reset()
         done = False
         ep_ret = 0.0
+        info = {}
         while not done:
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
             logits, _ = policy.forward(obs_t)
@@ -33,14 +34,22 @@ def evaluate(policy: CommNetPolicy, env, episodes: int = 50, greedy: bool = True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate saved CommNet / NoComm policies.")
-    parser.add_argument("--env", choices=["nav", "lever", "traffic", "prey"], default="nav")
-    parser.add_argument("--policy", type=str, choices=["commnet", "nocomm"], default="commnet")
+    parser = argparse.ArgumentParser(
+        description="Evaluate saved CommNet / NoComm policies."
+    )
+    parser.add_argument(
+        "--env", choices=["nav", "lever", "traffic", "combat"], default="nav"
+    )
+    parser.add_argument(
+        "--policy", type=str, choices=["commnet", "nocomm"], default="commnet"
+    )
     parser.add_argument("--checkpoint", type=str, required=False)
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--agents", type=int, default=3)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--comm_steps", type=int, default=2)
+
+    # Nav args
     parser.add_argument("--max_steps", type=int, default=50)
     parser.add_argument("--vision", type=float, default=0.75)
     parser.add_argument("--spawn_span", type=float, default=0.4)
@@ -51,25 +60,109 @@ def main():
     parser.add_argument("--goal_eps", type=float, default=0.2)
     parser.add_argument("--time_penalty", type=float, default=0.0)
     parser.add_argument("--distance_weight", type=float, default=1.0)
+
+    # Lever args
     parser.add_argument("--num_levers", type=int, default=None)
     parser.add_argument("--pool_size", type=int, default=500)
+
+    # General args
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--greedy", action="store_true", help="Use argmax actions instead of sampling")
-    parser.add_argument("--lever_identity_encoder", action="store_true", help="Use identity encoder for lever game")
-    parser.add_argument("--comm_mlp", action="store_true", help="Use 2-layer MLP for comm blocks")
-    parser.add_argument("--comm_mlp_hidden", type=int, default=None, help="Hidden size for comm MLP blocks")
-    parser.add_argument("--lever_rank_features", action="store_true", help="Add prefix-sum rank features for lever game")
-    parser.add_argument("--lever_oracle", action="store_true", help="Use deterministic lever oracle (comm-only) for evaluation")
-    parser.add_argument("--no_encoder_activation", action="store_true", help="Disable encoder tanh activation")
-    parser.add_argument("--no_comm_activation", action="store_true", help="Disable comm layer tanh activation")
+    parser.add_argument(
+        "--greedy", action="store_true", help="Use argmax actions instead of sampling"
+    )
+
+    # CommNet feature flags
+    parser.add_argument(
+        "--lever_identity_encoder",
+        action="store_true",
+        help="Use identity encoder for lever game",
+    )
+    parser.add_argument(
+        "--comm_mlp", action="store_true", help="Use 2-layer MLP for comm blocks"
+    )
+    parser.add_argument(
+        "--comm_mlp_hidden",
+        type=int,
+        default=None,
+        help="Hidden size for comm MLP blocks",
+    )
+    parser.add_argument(
+        "--lever_rank_features",
+        action="store_true",
+        help="Add prefix-sum rank features for lever game",
+    )
+    parser.add_argument(
+        "--lever_oracle",
+        action="store_true",
+        help="Use deterministic lever oracle (comm-only) for evaluation",
+    )
+    parser.add_argument(
+        "--no_encoder_activation",
+        action="store_true",
+        help="Disable encoder tanh activation",
+    )
+    parser.add_argument(
+        "--no_comm_activation",
+        action="store_true",
+        help="Disable comm layer tanh activation",
+    )
+
     # Traffic junction args
-    parser.add_argument("--grid_size", type=int, default=7, help="Grid size for traffic/prey environments")
-    parser.add_argument("--vision_range", type=int, default=2, help="Vision range for traffic/prey environments")
-    parser.add_argument("--spawn_mode", type=str, default="corners", choices=["corners", "random"], help="Spawn mode for traffic junction")
-    # Predator-prey args
-    parser.add_argument("--num_prey", type=int, default=1, help="Number of prey in predator-prey environment")
-    parser.add_argument("--catch_radius", type=float, default=1.0, help="Catch radius for predator-prey")
-    parser.add_argument("--prey_move_prob", type=float, default=0.5, help="Probability prey moves each step")
+    parser.add_argument(
+        "--traffic_grid_size",
+        type=int,
+        default=7,
+        help="Grid size for traffic environment",
+    )
+    parser.add_argument(
+        "--vision_range",
+        type=int,
+        default=2,
+        help="Vision range for traffic environment",
+    )
+    parser.add_argument(
+        "--spawn_mode",
+        type=str,
+        default="corners",
+        choices=["corners", "random"],
+        help="Spawn mode for traffic junction",
+    )
+
+    # Combat args (paper-parallel defaults)
+    parser.add_argument(
+        "--combat_grid_size",
+        type=int,
+        default=15,
+        help="Grid size for combat environment (paper uses 15)",
+    )
+    parser.add_argument(
+        "--combat_max_steps",
+        type=int,
+        default=40,
+        help="Combat horizon (paper uses 40)",
+    )
+    parser.add_argument(
+        "--combat_spawn_square",
+        type=int,
+        default=5,
+        help="Spawn square side length (paper uses 5)",
+    )
+    parser.add_argument(
+        "--combat_visual_range", type=int, default=1, help="Visual range (3x3 => 1)"
+    )
+    parser.add_argument(
+        "--combat_firing_range", type=int, default=1, help="Firing range (3x3 => 1)"
+    )
+    parser.add_argument(
+        "--combat_hp_max", type=int, default=3, help="HP per agent (paper uses 3)"
+    )
+    parser.add_argument(
+        "--combat_cooldown_steps",
+        type=int,
+        default=1,
+        help="Cooldown after attack (paper uses 1)",
+    )
+
     args = parser.parse_args()
 
     if args.env == "nav":
@@ -96,7 +189,7 @@ def main():
         )
     elif args.env == "traffic":
         env = TrafficJunctionEnv(
-            grid_size=args.grid_size,
+            grid_size=args.traffic_grid_size,
             num_agents=args.agents,
             max_steps=args.max_steps,
             vision_range=args.vision_range,
@@ -106,18 +199,16 @@ def main():
             spawn_mode=args.spawn_mode,
             seed=args.seed,
         )
-    elif args.env == "prey":
-        env = PredatorPreyEnv(
-            grid_size=args.grid_size,
-            num_predators=args.agents,
-            num_prey=args.num_prey,
-            max_steps=args.max_steps,
-            vision_range=args.vision_range,
-            catch_radius=args.catch_radius,
-            success_bonus=args.success_bonus,
-            time_penalty=args.time_penalty,
-            prey_move_prob=args.prey_move_prob,
-            collision_penalty=args.collision_penalty,
+    elif args.env == "combat":
+        env = CombatEnv(
+            grid_size=args.combat_grid_size,
+            m=args.agents,
+            max_steps=args.combat_max_steps,
+            spawn_square=args.combat_spawn_square,
+            visual_range=args.combat_visual_range,
+            firing_range=args.combat_firing_range,
+            hp_max=args.combat_hp_max,
+            cooldown_steps=args.combat_cooldown_steps,
             seed=args.seed,
         )
     else:
@@ -145,8 +236,12 @@ def main():
         state = torch.load(ckpt_path, map_location="cpu")
         policy.load_state_dict(state)
 
-    mean_return, success_rate = evaluate(policy, env, episodes=args.episodes, greedy=args.greedy)
-    print(f"{args.policy} | mean return: {mean_return:.3f} | success rate: {success_rate:.2%}")
+    mean_return, success_rate = evaluate(
+        policy, env, episodes=args.episodes, greedy=args.greedy
+    )
+    print(
+        f"{args.policy} | mean return: {mean_return:.3f} | success rate: {success_rate:.2%}"
+    )
 
 
 if __name__ == "__main__":
