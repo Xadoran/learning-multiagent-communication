@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 
 
@@ -56,8 +58,16 @@ class TrafficJunctionEnv:
         vision_range: int = 1,  # 3x3 neighborhood
         seed: int | None = None,
     ):
-        assert grid_size == 14, "CommNet paper uses 14x14 for Traffic Junction"
-        assert vision_range == 1, "CommNet paper uses 3x3 neighborhood (vision_range=1)"
+        if grid_size != 14:
+            warnings.warn(
+                f"TrafficJunctionEnv: grid_size={grid_size} deviates from paper default 14",
+                stacklevel=2,
+            )
+        if vision_range != 1:
+            warnings.warn(
+                f"TrafficJunctionEnv: vision_range={vision_range} deviates from paper default 1 (3x3)",
+                stacklevel=2,
+            )
 
         self.grid_size = grid_size
         self.nmax = nmax
