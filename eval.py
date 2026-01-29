@@ -125,21 +125,32 @@ def main():
     parser.add_argument(
         "--traffic_grid_size",
         type=int,
-        default=7,
+        default=14,
         help="Grid size for traffic environment",
     )
     parser.add_argument(
         "--vision_range",
         type=int,
-        default=2,
+        default=1,
         help="Vision range for traffic environment",
     )
     parser.add_argument(
-        "--spawn_mode",
-        type=str,
-        default="corners",
-        choices=["corners", "random"],
-        help="Spawn mode for traffic junction",
+        "--traffic_p_arrive",
+        type=float,
+        default=0.2,
+        help="Arrival probability per direction (traffic junction)",
+    )
+    parser.add_argument(
+        "--traffic_r_coll",
+        type=float,
+        default=-10.0,
+        help="Collision reward (traffic junction; paper uses -10)",
+    )
+    parser.add_argument(
+        "--traffic_r_time",
+        type=float,
+        default=-0.01,
+        help="Time penalty coefficient (traffic junction; paper uses -0.01)",
     )
 
     # Combat args (paper-parallel defaults)
@@ -204,13 +215,12 @@ def main():
     elif args.env == "traffic":
         env = TrafficJunctionEnv(
             grid_size=args.traffic_grid_size,
-            num_agents=args.agents,
             max_steps=args.max_steps,
+            nmax=args.agents,
+            p_arrive=args.traffic_p_arrive,
+            r_coll=args.traffic_r_coll,
+            r_time=args.traffic_r_time,
             vision_range=args.vision_range,
-            collision_penalty=args.collision_penalty,
-            success_bonus=args.success_bonus,
-            time_penalty=args.time_penalty,
-            spawn_mode=args.spawn_mode,
             seed=args.seed,
         )
     elif args.env == "combat":
