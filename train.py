@@ -13,6 +13,13 @@ from envs.traffic_junction_env import TrafficJunctionEnv
 from envs.combat_env import CombatEnv
 from models.commnet import CommNetPolicy
 from utils import compute_returns, plot_rewards
+from analysis.logging_utils import (
+    RunLogger,
+    create_run_dir,
+    default_run_id,
+    extra_columns_for_env,
+    save_run_config,
+)
 
 
 def rollout_episode(env, policy: CommNetPolicy, gamma: float):
@@ -23,6 +30,7 @@ def rollout_episode(env, policy: CommNetPolicy, gamma: float):
     entropies: List[torch.Tensor] = []
 
     done = False
+    last_info = {}
     while not done:
         obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # [1, J, obs_dim]
         logits, baseline = policy.forward(obs_t)
@@ -32,7 +40,7 @@ def rollout_episode(env, policy: CommNetPolicy, gamma: float):
         dist_entropy = dist.entropy()
         actions_np = actions.squeeze(0).numpy()
 
-        obs, reward, done, _info = env.step(actions_np)
+        obs, reward, done, last_info = env.step(actions_np)
         rewards.append(reward)
         logprob_totals.append(logprobs.sum(dim=1).squeeze(0))  # scalar
         baselines.append(baseline.squeeze(0))
@@ -52,6 +60,8 @@ def rollout_episode(env, policy: CommNetPolicy, gamma: float):
         logprob_totals_t,
         entropies_t,
         float(np.sum(rewards)),
+        int(len(rewards)),
+        dict(last_info) if isinstance(last_info, dict) else {},
     )
 
 
@@ -67,6 +77,7 @@ def train_policy(
     checkpoint_path: str | None = None,
     save_checkpoint_every: int | None = None,
     checkpoint_prefix: str = "checkpoint",
+    run_logger: RunLogger | None = None,
 ):
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
@@ -90,18 +101,29 @@ def train_policy(
         batch_baselines = []
         batch_logprob_totals = []
         batch_entropies = []
-        batch_ep_returns = []
+        batch_ep_returns: list[float] = []
+        batch_ep_lens: list[int] = []
+        batch_last_infos: list[dict] = []
 
         for _ in range(batch_size):
-            returns, advantages, baselines, logprob_totals, entropies, ep_ret = (
-                rollout_episode(env, policy, gamma)
-            )
+            (
+                returns,
+                advantages,
+                baselines,
+                logprob_totals,
+                entropies,
+                ep_ret,
+                ep_len,
+                last_info,
+            ) = rollout_episode(env, policy, gamma)
             batch_returns.append(returns)
             batch_advantages.append(advantages)
             batch_baselines.append(baselines)
             batch_logprob_totals.append(logprob_totals)
             batch_entropies.append(entropies)
             batch_ep_returns.append(ep_ret)
+            batch_ep_lens.append(ep_len)
+            batch_last_infos.append(last_info)
 
         policy_losses = []
         value_losses = []
@@ -122,6 +144,20 @@ def train_policy(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
+
+        # Log per-episode metrics (not per update)
+        if run_logger is not None:
+            base_episode_idx = len(episode_returns)
+            for j in range(batch_size):
+                info = batch_last_infos[j] if j < len(batch_last_infos) else {}
+                success = int(bool(info.get("success", False))) if isinstance(info, dict) else 0
+                run_logger.append_episode(
+                    episode_idx=base_episode_idx + j,
+                    episode_return=batch_ep_returns[j],
+                    success=success,
+                    episode_len=batch_ep_lens[j],
+                    extras=info if isinstance(info, dict) else {},
+                )
 
         episode_returns.extend(batch_ep_returns)
 
@@ -171,6 +207,7 @@ def train_lever_supervised(
     checkpoint_path: str | None = None,
     save_checkpoint_every: int | None = None,
     checkpoint_prefix: str = "checkpoint",
+    run_logger: RunLogger | None = None,
 ):
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     ce_loss = nn.CrossEntropyLoss()
@@ -224,6 +261,15 @@ def train_lever_supervised(
         optimizer.step()
 
         episode_returns.append(1.0)
+        # Minimal logging hook (supervised updates are not true env episodes)
+        if run_logger is not None:
+            run_logger.append_episode(
+                episode_idx=len(episode_returns) - 1,
+                episode_return=1.0,
+                success=0,
+                episode_len=1,
+                extras={},
+            )
         if (ep + 1) % 100 == 0:
             avg_last = np.mean(episode_returns[-100:])
             print(
@@ -253,6 +299,67 @@ def train_lever_supervised(
             print(f"Saved checkpoint to {checkpoint_file} at episode {ep+1}")
 
     return episode_returns
+
+
+def _parse_seeds(seeds_csv: str) -> list[int]:
+    seeds = []
+    for part in seeds_csv.split(","):
+        s = part.strip()
+        if not s:
+            continue
+        seeds.append(int(s))
+    if not seeds:
+        raise ValueError("--seeds provided but empty")
+    return seeds
+
+
+def _build_env(args, seed: int):
+    if args.env == "nav":
+        return CooperativeNavEnv(
+            num_agents=args.agents,
+            max_steps=args.max_steps,
+            vision_radius=args.vision,
+            spawn_span=args.spawn_span,
+            collision_penalty=args.collision_penalty,
+            success_bonus=args.success_bonus,
+            progress_scale=args.progress_scale,
+            step_size=args.step_size,
+            goal_eps=args.goal_eps,
+            time_penalty=args.time_penalty,
+            distance_weight=args.distance_weight,
+            seed=seed,
+        )
+    if args.env == "lever":
+        return LeverGameEnv(
+            pool_size=args.pool_size,
+            active_agents=args.agents,
+            num_levers=args.num_levers,
+            seed=seed,
+        )
+    if args.env == "traffic":
+        return TrafficJunctionEnv(
+            grid_size=args.traffic_grid_size,
+            nmax=args.agents,
+            max_steps=args.max_steps,
+            p_arrive=args.traffic_p_arrive,
+            r_coll=args.traffic_r_coll,
+            r_time=args.traffic_r_time,
+            vision_range=args.vision_range,
+            seed=seed,
+        )
+    if args.env == "combat":
+        return CombatEnv(
+            grid_size=args.combat_grid_size,
+            m=args.agents,
+            max_steps=args.combat_max_steps,
+            spawn_square=args.combat_spawn_square,
+            visual_range=args.combat_visual_range,
+            firing_range=args.combat_firing_range,
+            hp_max=args.combat_hp_max,
+            cooldown_steps=args.combat_cooldown_steps,
+            seed=seed,
+        )
+    raise ValueError(f"Unknown environment: {args.env}")
 
 
 def main():
@@ -333,14 +440,32 @@ def main():
     parser.add_argument(
         "--traffic_grid_size",
         type=int,
-        default=7,
+        default=14,
         help="Grid size for traffic environment",
     )
     parser.add_argument(
         "--vision_range",
         type=int,
-        default=2,
+        default=1,
         help="Vision range for traffic environment",
+    )
+    parser.add_argument(
+        "--traffic_p_arrive",
+        type=float,
+        default=0.2,
+        help="Arrival probability per direction (traffic junction)",
+    )
+    parser.add_argument(
+        "--traffic_r_coll",
+        type=float,
+        default=-10.0,
+        help="Collision reward (traffic junction; paper uses -10)",
+    )
+    parser.add_argument(
+        "--traffic_r_time",
+        type=float,
+        default=-0.01,
+        help="Time penalty coefficient (traffic junction; paper uses -0.01)",
     )
     parser.add_argument(
         "--spawn_mode",
@@ -405,169 +530,187 @@ def main():
         help="Save checkpoint every N episodes (optional)",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds (e.g. 0,1,2,3,4). If provided, runs both CommNet and NoComm for each seed.",
+    )
     parser.add_argument("--plot_path", type=str, default="plots/commnet_vs_nocomm.png")
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    if args.env == "nav":
-        env = CooperativeNavEnv(
-            num_agents=args.agents,
-            max_steps=args.max_steps,
-            vision_radius=args.vision,
-            spawn_span=args.spawn_span,
-            collision_penalty=args.collision_penalty,
-            success_bonus=args.success_bonus,
-            progress_scale=args.progress_scale,
-            step_size=args.step_size,
-            goal_eps=args.goal_eps,
-            time_penalty=args.time_penalty,
-            distance_weight=args.distance_weight,
-            seed=args.seed,
-        )
-    elif args.env == "lever":
-        env = LeverGameEnv(
-            pool_size=args.pool_size,
-            active_agents=args.agents,
-            num_levers=args.num_levers,
-            seed=args.seed,
-        )
-    elif args.env == "traffic":
-        env = TrafficJunctionEnv(
-            grid_size=args.traffic_grid_size,
-            num_agents=args.agents,
-            max_steps=args.max_steps,
-            vision_range=args.vision_range,
-            collision_penalty=args.collision_penalty,
-            success_bonus=args.success_bonus,
-            time_penalty=args.time_penalty,
-            spawn_mode=args.spawn_mode,
-            seed=args.seed,
-        )
-    elif args.env == "combat":
-        env = CombatEnv(
-            grid_size=args.combat_grid_size,
-            m=args.agents,
-            max_steps=args.combat_max_steps,
-            spawn_square=args.combat_spawn_square,
-            visual_range=args.combat_visual_range,
-            firing_range=args.combat_firing_range,
-            hp_max=args.combat_hp_max,
-            cooldown_steps=args.combat_cooldown_steps,
-            seed=args.seed,
-        )
-    else:
-        raise ValueError(f"Unknown environment: {args.env}")
+    seeds = [args.seed] if args.seeds is None else _parse_seeds(args.seeds)
 
     use_supervised_lever = args.env == "lever" and args.lever_supervised
     train_fn = train_lever_supervised if use_supervised_lever else train_policy
 
-    comm_policy = CommNetPolicy(
-        obs_dim=env.obs_dim,
-        action_dim=env.action_dim,
-        hidden_dim=args.hidden,
-        K=args.comm_steps,
-        use_comm=True,
-        identity_encoder=(args.env == "lever" and args.lever_identity_encoder),
-        comm_mlp=args.comm_mlp,
-        comm_mlp_hidden=args.comm_mlp_hidden,
-        lever_rank_features=(args.env == "lever" and args.lever_rank_features),
-        encoder_activation=not args.no_encoder_activation,
-        comm_activation=not args.no_comm_activation,
-    )
+    def _run_one(model_name: str, use_comm: bool, seed: int):
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
-    comm_checkpoint = args.resume_checkpoint if args.resume_checkpoint else None
-    if comm_checkpoint and not os.path.exists(comm_checkpoint):
-        print(f"Warning: Checkpoint {comm_checkpoint} not found, starting from scratch")
-        comm_checkpoint = None
+        env = _build_env(args, seed=seed)
 
-    if use_supervised_lever:
-        comm_returns = train_fn(
-            episodes=args.episodes,
-            env=env,
-            policy=comm_policy,
-            lr=args.lr,
-            entropy_beta=args.entropy_beta,
-            batch_size=args.lever_batch,
-            checkpoint_path=comm_checkpoint,
-            save_checkpoint_every=args.save_checkpoint_every,
-            checkpoint_prefix="commnet",
-        )
-    else:
-        comm_returns = train_fn(
-            episodes=args.episodes,
-            env=env,
-            policy=comm_policy,
-            lr=args.lr,
-            gamma=args.gamma,
-            alpha_value=args.alpha_value,
-            entropy_beta=args.entropy_beta,
-            batch_size=args.batch_size,
-            checkpoint_path=comm_checkpoint,
-            save_checkpoint_every=args.save_checkpoint_every,
-            checkpoint_prefix="commnet",
+        policy = CommNetPolicy(
+            obs_dim=env.obs_dim,
+            action_dim=env.action_dim,
+            hidden_dim=args.hidden,
+            K=args.comm_steps,
+            use_comm=use_comm,
+            identity_encoder=(args.env == "lever" and args.lever_identity_encoder),
+            comm_mlp=args.comm_mlp,
+            comm_mlp_hidden=args.comm_mlp_hidden,
+            lever_rank_features=(args.env == "lever" and args.lever_rank_features),
+            encoder_activation=not args.no_encoder_activation,
+            comm_activation=not args.no_comm_activation,
         )
 
-    nocomm_policy = CommNetPolicy(
-        obs_dim=env.obs_dim,
-        action_dim=env.action_dim,
-        hidden_dim=args.hidden,
-        K=args.comm_steps,
-        use_comm=False,
-        identity_encoder=(args.env == "lever" and args.lever_identity_encoder),
-        comm_mlp=args.comm_mlp,
-        comm_mlp_hidden=args.comm_mlp_hidden,
-        lever_rank_features=(args.env == "lever" and args.lever_rank_features),
-        encoder_activation=not args.no_encoder_activation,
-        comm_activation=not args.no_comm_activation,
-    )
-
-    nocomm_checkpoint = None
-    if args.resume_checkpoint:
-        nocomm_checkpoint = args.resume_checkpoint.replace("commnet", "nocomm")
-        if not os.path.exists(nocomm_checkpoint):
-            nocomm_checkpoint = None
-
-    if use_supervised_lever:
-        nocomm_returns = train_fn(
-            episodes=args.episodes,
-            env=env,
-            policy=nocomm_policy,
-            lr=args.lr,
-            entropy_beta=args.entropy_beta,
-            batch_size=args.lever_batch,
-            checkpoint_path=nocomm_checkpoint,
-            save_checkpoint_every=args.save_checkpoint_every,
-            checkpoint_prefix="nocomm",
+        # Create run folder + config
+        run_id = default_run_id(
+            seed=seed,
+            K=args.comm_steps,
+            vision=(args.vision if args.env == "nav" else None),
+            vision_range=(args.vision_range if args.env == "traffic" else None),
         )
-    else:
-        nocomm_returns = train_fn(
-            episodes=args.episodes,
-            env=env,
-            policy=nocomm_policy,
-            lr=args.lr,
-            gamma=args.gamma,
-            alpha_value=args.alpha_value,
-            entropy_beta=args.entropy_beta,
-            batch_size=args.batch_size,
-            checkpoint_path=nocomm_checkpoint,
-            save_checkpoint_every=args.save_checkpoint_every,
-            checkpoint_prefix="nocomm",
+        run_dir = create_run_dir(args.env, model_name, run_id)
+        logger = RunLogger(run_dir=run_dir, extra_columns=extra_columns_for_env(args.env))
+
+        run_config = {
+            "env": args.env,
+            "model": model_name,
+            "use_comm": bool(use_comm),
+            "seed": int(seed),
+            "agents": int(args.agents),
+            "hidden": int(args.hidden),
+            "K": int(args.comm_steps),
+            "episodes": int(args.episodes),
+            "lr": float(args.lr),
+            "gamma": float(args.gamma),
+            "alpha_value": float(args.alpha_value),
+            "entropy_beta": float(args.entropy_beta),
+            "batch_size": int(args.batch_size),
+            "max_steps": int(args.max_steps),
+            # CommNet feature flags
+            "comm_mlp": bool(args.comm_mlp),
+            "comm_mlp_hidden": args.comm_mlp_hidden,
+            "no_encoder_activation": bool(args.no_encoder_activation),
+            "no_comm_activation": bool(args.no_comm_activation),
+            # Env-specific params (best-effort)
+            "nav": {
+                "vision_radius": float(args.vision),
+                "spawn_span": float(args.spawn_span),
+                "collision_penalty": float(args.collision_penalty),
+                "success_bonus": float(args.success_bonus),
+                "progress_scale": float(args.progress_scale),
+                "step_size": float(args.step_size),
+                "goal_eps": float(args.goal_eps),
+                "time_penalty": float(args.time_penalty),
+                "distance_weight": float(args.distance_weight),
+            }
+            if args.env == "nav"
+            else None,
+            "lever": {
+                "pool_size": int(args.pool_size),
+                "num_levers": args.num_levers,
+                "lever_supervised": bool(args.lever_supervised),
+                "lever_identity_encoder": bool(args.lever_identity_encoder),
+                "lever_rank_features": bool(args.lever_rank_features),
+                "lever_batch": int(args.lever_batch),
+            }
+            if args.env == "lever"
+            else None,
+            "traffic": {
+                "grid_size": int(args.traffic_grid_size),
+                "nmax": int(args.agents),
+                "vision_range": int(args.vision_range),
+                "p_arrive": float(args.traffic_p_arrive),
+                "r_coll": float(args.traffic_r_coll),
+                "r_time": float(args.traffic_r_time),
+            }
+            if args.env == "traffic"
+            else None,
+            "combat": {
+                "grid_size": int(args.combat_grid_size),
+                "max_steps": int(args.combat_max_steps),
+                "spawn_square": int(args.combat_spawn_square),
+                "visual_range": int(args.combat_visual_range),
+                "firing_range": int(args.combat_firing_range),
+                "hp_max": int(args.combat_hp_max),
+                "cooldown_steps": int(args.combat_cooldown_steps),
+            }
+            if args.env == "combat"
+            else None,
+        }
+        save_run_config(run_dir, run_config)
+
+        checkpoint_path = args.resume_checkpoint if args.resume_checkpoint else None
+        if checkpoint_path and model_name == "nocomm":
+            # Preserve legacy behavior: if user passes a commnet checkpoint path,
+            # try the corresponding nocomm path.
+            checkpoint_path = checkpoint_path.replace("commnet", "nocomm")
+        if checkpoint_path and not os.path.exists(checkpoint_path):
+            print(
+                f"Warning: Checkpoint {checkpoint_path} not found, starting from scratch"
+            )
+            checkpoint_path = None
+
+        if use_supervised_lever:
+            returns = train_fn(
+                episodes=args.episodes,
+                env=env,
+                policy=policy,
+                lr=args.lr,
+                entropy_beta=args.entropy_beta,
+                batch_size=args.lever_batch,
+                checkpoint_path=checkpoint_path,
+                save_checkpoint_every=args.save_checkpoint_every,
+                checkpoint_prefix=model_name,
+                run_logger=logger,
+            )
+        else:
+            returns = train_fn(
+                episodes=args.episodes,
+                env=env,
+                policy=policy,
+                lr=args.lr,
+                gamma=args.gamma,
+                alpha_value=args.alpha_value,
+                entropy_beta=args.entropy_beta,
+                batch_size=args.batch_size,
+                checkpoint_path=checkpoint_path,
+                save_checkpoint_every=args.save_checkpoint_every,
+                checkpoint_prefix=model_name,
+                run_logger=logger,
+            )
+        return policy, returns, run_dir
+
+    all_comm_returns = None
+    all_nocomm_returns = None
+    last_comm_policy = None
+    last_nocomm_policy = None
+
+    for seed in seeds:
+        comm_policy, comm_returns, _comm_run_dir = _run_one("commnet", True, seed)
+        nocomm_policy, nocomm_returns, _nocomm_run_dir = _run_one("nocomm", False, seed)
+
+        last_comm_policy = comm_policy
+        last_nocomm_policy = nocomm_policy
+        all_comm_returns = comm_returns
+        all_nocomm_returns = nocomm_returns
+
+    # Keep legacy artifacts for the single-seed case
+    if args.seeds is None and last_comm_policy is not None and last_nocomm_policy is not None:
+        os.makedirs("checkpoints", exist_ok=True)
+        torch.save(last_comm_policy.state_dict(), "checkpoints/commnet.pt")
+        torch.save(last_nocomm_policy.state_dict(), "checkpoints/nocomm.pt")
+
+        plot_rewards(
+            [
+                ("CommNet", all_comm_returns if all_comm_returns is not None else []),
+                ("NoComm", all_nocomm_returns if all_nocomm_returns is not None else []),
+            ],
+            out_path=args.plot_path,
         )
-
-    os.makedirs("checkpoints", exist_ok=True)
-    torch.save(comm_policy.state_dict(), "checkpoints/commnet.pt")
-    torch.save(nocomm_policy.state_dict(), "checkpoints/nocomm.pt")
-
-    plot_rewards(
-        [
-            ("CommNet", comm_returns),
-            ("NoComm", nocomm_returns),
-        ],
-        out_path=args.plot_path,
-    )
-    print(f"Saved plot to {args.plot_path}")
+        print(f"Saved plot to {args.plot_path}")
 
 
 if __name__ == "__main__":

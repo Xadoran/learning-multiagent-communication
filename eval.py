@@ -1,4 +1,7 @@
 import argparse
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -69,6 +72,17 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--greedy", action="store_true", help="Use argmax actions instead of sampling"
+    )
+    parser.add_argument(
+        "--save_eval",
+        action="store_true",
+        help="If set, write eval summary JSON (see --run_dir)",
+    )
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Run folder to write eval.json into (e.g. runs/nav/commnet/<run_id>/)",
     )
 
     # CommNet feature flags
@@ -242,6 +256,23 @@ def main():
     print(
         f"{args.policy} | mean return: {mean_return:.3f} | success rate: {success_rate:.2%}"
     )
+
+    if args.save_eval:
+        if args.run_dir is None:
+            raise ValueError("--save_eval requires --run_dir")
+        out_dir = Path(args.run_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "eval.json"
+        payload = {
+            "mean_return": float(mean_return),
+            "success_rate": float(success_rate),
+            "episodes": int(args.episodes),
+            "greedy": bool(args.greedy),
+            "env": args.env,
+            "policy": args.policy,
+            "seed": int(args.seed),
+        }
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 if __name__ == "__main__":
